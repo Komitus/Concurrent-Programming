@@ -1,0 +1,89 @@
+package main
+
+import (
+	"fmt"
+	"math/rand"
+	"time"
+)
+
+type query_for_rt struct {
+	is_allowed chan bool
+	is_done    chan bool
+}
+
+func node_routine(node_data *Node, printer chan<- string) {
+
+	sender_lock := make(chan query_for_rt)
+	receiver_lock := make(chan query_for_rt)
+
+	//statefull goroutine
+	go func() {
+		for {
+			select {
+			case local_sender := <-sender_lock:
+				local_sender.is_allowed <- true
+				<-local_sender.is_done
+			case local_receiver := <-receiver_lock:
+				local_receiver.is_allowed <- true
+				<-local_receiver.is_done
+			}
+		}
+	}()
+
+	//receiver
+	go func() {
+		node_id := node_data.id
+		for {
+
+			packet := <-node_data.rec_channel
+			fmt.Println("Node ", node_id, " received ", packet.offer, " from ", packet.came_from)
+			make_lock := query_for_rt{make(chan bool), make(chan bool)}
+			receiver_lock <- make_lock
+			<-make_lock.is_allowed
+			for j := 0; j < len(packet.offer); j++ {
+				newcost := uint16(packet.offer[j].cost + 1)
+				if newcost < node_data.routing_table[packet.offer[j].node_id].cost {
+					node_data.routing_table[packet.offer[j].node_id].nextHop = packet.came_from
+					node_data.routing_table[packet.offer[j].node_id].cost = newcost
+					node_data.routing_table[packet.offer[j].node_id].changed = true
+					printer <- fmt.Sprintf("RT in %d node at %d : nextHop = %d, cost = %d, changed = true",
+						node_id, packet.offer[j].node_id, newcost, packet.came_from)
+				}
+
+			}
+			make_lock.is_done <- true
+		}
+	}()
+
+	//sender
+	go func() {
+		node_id := node_data.id
+		s := rand.NewSource(time.Now().UnixNano() + int64(node_id))
+		r := rand.New(s)
+		rt_size := uint16(len(node_data.routing_table))
+		for {
+			time.Sleep(time.Duration(r.Float64() * float64(time.Second)))
+			make_lock := query_for_rt{make(chan bool), make(chan bool)}
+			sender_lock <- make_lock
+			<-make_lock.is_allowed
+			var packet_offer []PacketData
+			for j := uint16(0); j < rt_size; j++ {
+				if node_data.routing_table[j].changed == true && node_id != j {
+					packet_offer = append(packet_offer, PacketData{uint16(j), node_data.routing_table[j].cost})
+					node_data.routing_table[j].changed = false
+					printer <- fmt.Sprintf("RT in %d node at %d : changed = false", node_id, j)
+				}
+			}
+			make_lock.is_done <- true
+			if len(packet_offer) > 0 {
+				packet := Packet{node_id, packet_offer}
+
+				for neighbour_id, channel := range node_data.neighbours {
+					channel <- packet
+					printer <- fmt.Sprintf("Node %d is sending %d to %d", node_id, packet.offer, neighbour_id)
+				}
+			}
+		}
+	}()
+
+}

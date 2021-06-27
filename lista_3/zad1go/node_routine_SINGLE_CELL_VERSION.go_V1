@@ -1,0 +1,100 @@
+package main
+
+import (
+	"fmt"
+	"math/rand"
+	"time"
+)
+
+type CheckAndSetCell struct {
+	cameFrom   uint16
+	packetCell PacketData
+	retVal     chan bool
+}
+type CheckAndSetFalse struct {
+	j      uint16
+	retVal chan int32
+}
+
+func node_routine(node_data *Node, printer chan<- string) {
+
+	cellChannel := make(chan CheckAndSetCell)
+	falseChannel := make(chan CheckAndSetFalse)
+
+	//statefull goroutine
+	go func() {
+		for {
+			select {
+			case packetToCheck := <-cellChannel:
+				newCost := packetToCheck.packetCell.cost + 1
+				if newCost < node_data.routing_table[packetToCheck.packetCell.node_id].cost {
+					node_data.routing_table[packetToCheck.packetCell.node_id].nextHop = packetToCheck.cameFrom
+					node_data.routing_table[packetToCheck.packetCell.node_id].cost = newCost
+					node_data.routing_table[packetToCheck.packetCell.node_id].changed = true
+					packetToCheck.retVal <- true
+				} else {
+					packetToCheck.retVal <- true
+				}
+			case cellToFalse := <-falseChannel:
+				if node_data.routing_table[cellToFalse.j].changed == true {
+					node_data.routing_table[cellToFalse.j].changed = false
+					cellToFalse.retVal <- int32(node_data.routing_table[cellToFalse.j].cost)
+				} else {
+					cellToFalse.retVal <- -1
+				}
+			}
+		}
+	}()
+
+	//receiver
+	go func() {
+		node_id := node_data.id
+		for {
+
+			packet := <-node_data.rec_channel
+			printer <- fmt.Sprint("Node ", node_id, " received ", packet.offer, " from ", packet.came_from)
+			for j := 0; j < len(packet.offer); j++ {
+				cellOperation := CheckAndSetCell{cameFrom: packet.came_from, packetCell: packet.offer[j], retVal: make(chan bool)}
+				cellChannel <- cellOperation
+				result := <-cellOperation.retVal
+				if result == true {
+					printer <- fmt.Sprintf("RT in %d node at %d : nextHop = %d, cost = %d, changed = true",
+						node_id, packet.offer[j].node_id, packet.offer[j].cost+1, packet.came_from)
+				}
+			}
+		}
+	}()
+
+	//sender
+	go func() {
+		node_id := node_data.id
+		s := rand.NewSource(time.Now().UnixNano() + int64(node_id))
+		r := rand.New(s)
+		rt_size := uint16(len(node_data.routing_table))
+		for {
+			time.Sleep(time.Duration(r.Float64() * float64(time.Second)))
+			var packet_offer []PacketData
+			for j := uint16(0); j < rt_size; j++ {
+				if node_id != j {
+					cellOperation := CheckAndSetFalse{j: j, retVal: make(chan int32)}
+					falseChannel <- cellOperation
+					cost := <-cellOperation.retVal
+					if cost > 0 {
+						packet_offer = append(packet_offer, PacketData{uint16(j), uint16(cost)})
+						printer <- fmt.Sprintf("RT in %d node at %d : changed = false", node_id, j)
+					}
+
+				}
+			}
+			if len(packet_offer) > 0 {
+				packet := Packet{node_id, packet_offer}
+
+				for neighbour_id, channel := range node_data.neighbours {
+					printer <- fmt.Sprintf("Node %d is sending %d to %d", node_id, packet.offer, neighbour_id)
+					channel <- packet
+				}
+			}
+		}
+	}()
+
+}
